@@ -9,6 +9,9 @@ import asyncio
 import uuid
 from json import dumps
 
+# Import the logger module
+from app.logger import logger
+
 app = FastAPI()
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -16,10 +19,11 @@ templates = Jinja2Templates(directory="templates")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://localhost:3001"],  # Add your Next.js frontend URL here
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Type"]
 )
 
 class Task(BaseModel):
@@ -91,129 +95,256 @@ task_manager = TaskManager()
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
+# Import run_flow functionality
+from app.agent.manus import Manus
+from app.flow.base import FlowType
+from app.flow.flow_factory import FlowFactory
+# Import the task executor
+from app.task_executor import task_executor
+
 @app.post("/tasks")
 async def create_task(prompt: str = Body(..., embed=True)):
-    task = task_manager.create_task(prompt)
-    asyncio.create_task(run_task(task.id, prompt))
-    return {"task_id": task.id}
-
-from app.agent.toolcall import ToolCallAgent
+    try:
+        # Create a new task and start processing
+        task = task_manager.create_task(prompt)
+        print(f"Created task: {task.id}")
+        
+        # Start processing in the background
+        asyncio.create_task(run_task(task.id, prompt))
+        
+        # Return a simple, clean response with just the task_id as a string
+        return {"task_id": task.id}
+    except Exception as e:
+        print(f"Error creating task: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create task: {str(e)}")
 
 async def run_task(task_id: str, prompt: str):
     try:
         task_manager.tasks[task_id].status = "running"
         
-        agent = ToolCallAgent(
-            name="TaskAgent",
-            description="Agent for handling task execution",
-            max_steps=30
-        )
-        
-        async def on_think(thought):
-            await task_manager.update_task_step(task_id, 0, thought, "think")
-            
-        async def on_tool_execute(tool, input):
-            await task_manager.update_task_step(task_id, 0, f"执行工具: {tool}\n输入: {input}", "tool")
-            
-        async def on_action(action):
-            await task_manager.update_task_step(task_id, 0, f"执行动作: {action}", "act")
-            
-        async def on_run(step, result):
-            await task_manager.update_task_step(task_id, step, result, "run")
-            
-        from app.logger import logger
-        
+        # Create a custom SSE log handler to capture logs
         class SSELogHandler:
             def __init__(self, task_id):
                 self.task_id = task_id
+                self.step_counter = 0
                 
             async def __call__(self, message):
-                import re
-                # 提取 - 后面的内容
-                cleaned_message = re.sub(r'^.*? - ', '', message)
-                
-                event_type = "log"
-                if "✨ TaskAgent's thoughts:" in cleaned_message:
-                    event_type = "think"
-                elif "🛠️ TaskAgent selected" in cleaned_message:
-                    event_type = "tool"
-                elif "🎯 Tool" in cleaned_message:
-                    event_type = "act"
-                elif "📝 Oops!" in cleaned_message:
-                    event_type = "error"
-                elif "🏁 Special tool" in cleaned_message:
-                    event_type = "complete"
+                # Handle string messages from logger
+                if isinstance(message, str):
+                    import re
                     
-                await task_manager.update_task_step(self.task_id, 0, cleaned_message, event_type)
+                    # Extract content and identify message type based on patterns
+                    event_type = "log"
+                    cleaned_message = message
+                    
+                    # Remove timestamp and log level if present
+                    timestamp_pattern = r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.\d{3} \| \w+ +\| '
+                    cleaned_message = re.sub(timestamp_pattern, '', cleaned_message)
+                    
+                    # Remove module info if present
+                    module_pattern = r'^[\w\.]+:\w+:\d+ - '
+                    cleaned_message = re.sub(module_pattern, '', cleaned_message)
+                    
+                    # Determine event type based on message content and icons
+                    if '✨' in cleaned_message or 'thoughts:' in cleaned_message.lower():
+                        event_type = "think"
+                        # Extract the actual thought content after the emoji
+                        thoughts_match = re.search(r'✨ \w+\'s thoughts: (.*)', cleaned_message)
+                        if thoughts_match:
+                            cleaned_message = thoughts_match.group(1)
+                    elif '🛠️' in cleaned_message or 'selected tool' in cleaned_message.lower():
+                        event_type = "tool"
+                    elif '🔧' in cleaned_message or 'Activating tool:' in cleaned_message:
+                        event_type = "tool"
+                    elif '🎯' in cleaned_message or 'Tool .* completed' in cleaned_message:
+                        event_type = "act"
+                        # Extract the result after "Result:"
+                        result_match = re.search(r'Result: (.*)', cleaned_message, re.DOTALL)
+                        if result_match:
+                            cleaned_message = result_match.group(1)
+                    elif 'error' in cleaned_message.lower() or 'failed' in cleaned_message.lower():
+                        event_type = "error"
+                    
+                    print(f"Processing log: {event_type} - {cleaned_message[:50]}...")
+                    
+                    self.step_counter += 1
+                    await task_manager.update_task_step(self.task_id, self.step_counter, cleaned_message, event_type)
                 
+                # Handle structured log data
+                elif isinstance(message, dict):
+                    event_type = message.get("type", "log")
+                    content = message.get("message", "")
+                    step = message.get("step", self.step_counter)
+                    self.step_counter += 1
+                    await task_manager.update_task_step(self.task_id, step, content, event_type)
+        
+        # Register the SSE handler with the logger
         sse_handler = SSELogHandler(task_id)
-        logger.add(sse_handler)
-
-        result = await agent.run(prompt)
-        await task_manager.update_task_step(task_id, 1, result, "result")
-        await task_manager.complete_task(task_id)
+        
+        # Directly hook into the logger's handlers list to capture all logs
+        logger.add(sse_handler, level="INFO")
+        print(f"SSE handler registered for task {task_id}")
+        
+        try:
+            # Log the start of the task
+            await task_manager.update_task_step(task_id, 0, f"Starting task execution: {prompt}", "log")
+            
+            # Create a sublogger to capture all stdout/stderr during execution
+            import sys
+            from io import StringIO
+            
+            # Create a custom interceptor for stdout/stderr
+            class OutputInterceptor(StringIO):
+                def __init__(self, handler, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.handler = handler
+                    self.buffer = ""
+                
+                def write(self, text):
+                    self.buffer += text
+                    if '\n' in text:
+                        lines = self.buffer.split('\n')
+                        for line in lines[:-1]:
+                            if line.strip():  # Skip empty lines
+                                asyncio.create_task(self.handler(line))
+                        self.buffer = lines[-1]
+                    return super().write(text)
+            
+            # Create stdout/stderr interceptors
+            stdout_interceptor = OutputInterceptor(
+                lambda msg: task_manager.update_task_step(task_id, 9000 + sse_handler.step_counter, msg, "log")
+            )
+            
+            # Use the run_flow.py functionality
+            agents = {
+                "manus": Manus(),
+            }
+            
+            flow = FlowFactory.create_flow(
+                flow_type=FlowType.PLANNING,
+                agents=agents,
+            )
+            
+            # Execute with timeout to avoid hanging
+            result = await asyncio.wait_for(
+                flow.execute(prompt),
+                timeout=3600,  # 1 hour timeout
+            )
+            
+            # Log the result
+            await task_manager.update_task_step(task_id, 999, str(result), "result")
+            await task_manager.complete_task(task_id)
+            
+        except asyncio.TimeoutError:
+            error_msg = "Task execution timed out after 1 hour"
+            logger.error(error_msg)
+            await task_manager.fail_task(task_id, error_msg)
+            
+        except Exception as e:
+            error_msg = f"Task execution failed: {str(e)}"
+            logger.error(error_msg)
+            await task_manager.fail_task(task_id, error_msg)
+            
+        finally:
+            # Remove the logger handler
+            try:
+                logger.remove(sse_handler)
+            except:
+                pass
+            
     except Exception as e:
-        await task_manager.fail_task(task_id, str(e))
+        error_msg = f"Error in task setup: {str(e)}"
+        logger.error(error_msg)
+        await task_manager.fail_task(task_id, error_msg)
 
 @app.get("/tasks/{task_id}/events")
 async def task_events(task_id: str):
+    """Stream task events as Server-Sent Events (SSE)"""
+    
+    if task_id not in task_manager.tasks:
+        return JSONResponse(
+            status_code=404, 
+            content={"detail": "Task not found"}
+        )
+    
     async def event_generator():
+        """Generate SSE events for this task"""
         if task_id not in task_manager.queues:
-            yield f"event: error\ndata: {dumps({'message': 'Task not found'})}\n\n"
+            yield f"event: error\ndata: {{\"message\": \"Task queue not found\"}}\n\n"
             return
-
+            
         queue = task_manager.queues[task_id]
+        task = task_manager.tasks[task_id]
         
-        task = task_manager.tasks.get(task_id)
-        if task:
-            yield f"event: status\ndata: {dumps({
-                'type': 'status',
-                'status': task.status,
-                'steps': task.steps
-            })}\n\n"
-
+        # Send initial status with proper JSON escaping
+        try:
+            steps_json = dumps(task.steps)
+            status_data = dumps({
+                "type": "status", 
+                "status": task.status, 
+                "steps": task.steps
+            })
+            yield f"event: status\ndata: {status_data}\n\n"
+        except Exception as e:
+            print(f"Error sending initial status: {str(e)}")
+            yield f"event: error\ndata: {{\"message\": \"Error sending initial status\"}}\n\n"
+        
+        # Set up heartbeat
+        heartbeat_interval = 5  # Send a heartbeat every 5 seconds
+        
         while True:
             try:
-                event = await queue.get()
-                formatted_event = dumps(event)
-                
-                yield ": heartbeat\n\n"
-                
-                if event["type"] == "complete":
-                    yield f"event: complete\ndata: {formatted_event}\n\n"
-                    break
-                elif event["type"] == "error":
-                    yield f"event: error\ndata: {formatted_event}\n\n"
-                    break
-                elif event["type"] == "step":
-                    task = task_manager.tasks.get(task_id)
-                    if task:
-                        yield f"event: status\ndata: {dumps({
-                            'type': 'status',
-                            'status': task.status,
-                            'steps': task.steps
-                        })}\n\n"
-                    yield f"event: {event['type']}\ndata: {formatted_event}\n\n"
-                elif event["type"] in ["think", "tool", "act", "run"]:
-                    yield f"event: {event['type']}\ndata: {formatted_event}\n\n"
-                else:
-                    yield f"event: {event['type']}\ndata: {formatted_event}\n\n"
+                # Wait for an event with timeout for heartbeat
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=heartbeat_interval)
+                    
+                    # Ensure the event is properly serializable
+                    try:
+                        # Make sure we're sending valid JSON
+                        event_json = dumps(event)
+                        yield f"event: {event['type']}\ndata: {event_json}\n\n"
+                        
+                        # If the event is "complete", we're done
+                        if event["type"] == "complete":
+                            break
+                            
+                    except Exception as json_error:
+                        print(f"Error serializing event: {str(json_error)}, event: {event}")
+                        # Send a simplified version of the event
+                        safe_event = {
+                            "type": event.get("type", "error"),
+                            "message": "Error serializing event data"
+                        }
+                        yield f"event: {safe_event['type']}\ndata: {dumps(safe_event)}\n\n"
+                        
+                except asyncio.TimeoutError:
+                    # Send a heartbeat
+                    yield ": heartbeat\n\n"
+                    continue
                     
             except asyncio.CancelledError:
-                print(f"Client disconnected for task {task_id}")
+                print(f"SSE connection for task {task_id} was cancelled")
                 break
+                
             except Exception as e:
-                print(f"Error in event stream: {str(e)}")
-                yield f"event: error\ndata: {dumps({'message': str(e)})}\n\n"
+                print(f"Error in SSE stream for task {task_id}: {str(e)}")
+                safe_error = {"message": str(e)}
+                try:
+                    error_json = dumps(safe_error)
+                    yield f"event: error\ndata: {error_json}\n\n"
+                except:
+                    yield f"event: error\ndata: {{\"message\": \"Unknown error\"}}\n\n"
                 break
-
+                
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
+            "Connection": "keep-alive", 
+            "X-Accel-Buffering": "no",
+            "Content-Type": "text/event-stream",
+            "Access-Control-Allow-Origin": "*"  # Add CORS header for SSE
         }
     )
 

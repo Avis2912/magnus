@@ -1,32 +1,97 @@
 import sys
+import asyncio
+from typing import Callable, Any, Optional, Dict, List, Union
 from datetime import datetime
 
-from loguru import logger as _logger
+from loguru import logger as loguru_logger
 
 from app.config import PROJECT_ROOT
 
+# Configure loguru
+loguru_logger.remove()  # Remove default handler
+loguru_logger.add(
+    sys.stdout,
+    level="INFO",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+)
 
-_print_level = "INFO"
+# Create a wrapper class for logger to handle async handlers
+class AsyncLogger:
+    def __init__(self, logger_instance):
+        self._logger = logger_instance
+        self._async_handlers = []
+        self._handler_ids = {}
 
+    def info(self, message):
+        self._logger.info(message)
+        asyncio.create_task(self._notify_async_handlers(message))
+        
+    def warning(self, message):
+        self._logger.warning(message)
+        asyncio.create_task(self._notify_async_handlers(message))
+        
+    def error(self, message):
+        self._logger.error(message)
+        asyncio.create_task(self._notify_async_handlers(message))
+        
+    def debug(self, message):
+        self._logger.debug(message)
+        asyncio.create_task(self._notify_async_handlers(message))
 
-def define_log_level(print_level="INFO", logfile_level="DEBUG", name: str = None):
-    """Adjust the log level to above level"""
-    global _print_level
-    _print_level = print_level
+    def critical(self, message):
+        self._logger.critical(message)
+        asyncio.create_task(self._notify_async_handlers(message))
+        
+    def add(self, handler, level="INFO"):
+        """Add an async handler to the logger"""
+        if callable(handler) and handler not in self._async_handlers:
+            self._async_handlers.append(handler)
+            
+            # Also add to the underlying logger to catch direct logs
+            handler_id = self._logger.add(
+                lambda msg: asyncio.create_task(self._handle_original_log(handler, msg)),
+                level=level
+            )
+            self._handler_ids[handler] = handler_id
+            
+        return handler
+        
+    def remove(self, handler):
+        """Remove a handler from the logger"""
+        if handler in self._async_handlers:
+            self._async_handlers.remove(handler)
+            
+            # Also remove from the underlying logger
+            if handler in self._handler_ids:
+                try:
+                    self._logger.remove(self._handler_ids[handler])
+                    del self._handler_ids[handler]
+                except:
+                    pass
+                
+    async def _handle_original_log(self, handler, record):
+        """Format and handle a raw loguru record"""
+        try:
+            # Extract message from record
+            if hasattr(record, "message"):
+                message = record["message"]
+            else:
+                message = str(record)
+                
+            await handler(message)
+        except Exception as e:
+            print(f"Error in async log handler: {e}")
+        
+    async def _notify_async_handlers(self, message):
+        """Notify all async handlers of a new log message"""
+        for handler in self._async_handlers:
+            try:
+                await handler(message)
+            except Exception as e:
+                print(f"Error notifying async handler: {e}")
 
-    current_date = datetime.now()
-    formatted_date = current_date.strftime("%Y%m%d%H%M%S")
-    log_name = (
-        f"{name}_{formatted_date}" if name else formatted_date
-    )  # name a log with prefix name
-
-    _logger.remove()
-    _logger.add(sys.stderr, level=print_level)
-    _logger.add(PROJECT_ROOT / f"logs/{log_name}.log", level=logfile_level)
-    return _logger
-
-
-logger = define_log_level()
+# Create the logger instance
+logger = AsyncLogger(loguru_logger)
 
 
 if __name__ == "__main__":

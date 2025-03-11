@@ -21,7 +21,7 @@ class SWEAgent(ToolCallAgent):
     )
     special_tool_names: List[str] = Field(default_factory=lambda: [Terminate().name])
 
-    max_steps: int = 30
+    max_steps: int = 5
 
     bash: Bash = Field(default_factory=Bash)
     working_dir: str = "."

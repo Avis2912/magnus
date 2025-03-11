@@ -56,9 +56,9 @@ function setupSSE(taskId) {
 
         const container = document.getElementById('task-container');
         
-        let heartbeatTimer = setInterval(() => {
-            container.innerHTML += '<div class="ping">·</div>';
-        }, 5000);
+        // let heartbeatTimer = setInterval(() => {
+        //     container.innerHTML += '<div class="ping">·</div>';
+        // }, 5000);
 
         const pollInterval = setInterval(() => {
             fetch(`/tasks/${taskId}`)
